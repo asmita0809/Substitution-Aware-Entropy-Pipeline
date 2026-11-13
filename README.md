@@ -34,6 +34,64 @@ distributions. Shannon entropy is taken over that smoothed distribution.
 Chemically similar substitutions are pre-credited, and sparse columns stop
 producing false zero-probability cliffs.
 
+## Relation to existing methods
+
+**This is a lightweight reimplementation of an established idea, not a new
+method.** Restricting protein design using conservation derived from an
+alignment of homologs is well developed, implemented in widely used servers,
+and experimentally validated at a scale nothing here approaches. If you need
+design output you can act on, use those tools. If you want to see and tune
+every step of the reasoning, use this one.
+
+**PROSS** (Goldenzweig et al., *Mol Cell* 2016; PROSS 2 server, Weinstein et
+al., *Bioinformatics* 2021) builds a PSSM from homologs and combines it with
+Rosetta all-atom energies; the current server accepts an uploaded MSA directly.
+Its community evaluation is unusually thorough — twelve independent
+laboratories ran it on 14 unrelated targets without developer support, and nine
+of ten tested targets gained thermal stability (Peleg et al., *JMB* 2021).
+
+**FuncLib** (Khersonsky et al., *Mol Cell* 2018) is the closest relative to
+`make-resfile`. It constrains sequence space position by position using
+conservation (PSSM) together with ΔΔG mutational scanning, producing a
+per-position list of tolerated residues, then enumerates combinations with
+Rosetta. That per-position tolerated alphabet is the same object `make-resfile`
+emits — the difference is that FuncLib adds a structural energy term and this
+does not.
+
+**htFuncLib** (Weinstein et al., *Nat Commun* 2023) extends that with machine
+learning to design spaces whose mutations combine without incompatible
+interactions, recovering thousands of functional GFP variants. That directly
+addresses the per-column independence listed under Known Limitations below.
+
+Using entropy specifically, rather than a PSSM cutoff, also has its own
+lineage — Chan et al. (2004), Bae et al. (2008) and Borgo & Havranek (2012),
+cited at the end.
+
+And for *ranking* designs, learned models have overtaken profile methods
+outright. Inverse-folding models such as ProteinMPNN and ESM-IF substantially
+outperform sequence-statistics baselines in experimental benchmarks. A
+BLOSUM-smoothed profile over 22 sequences will not compete with them.
+
+### What this adds
+
+Nothing algorithmic. What it does offer:
+
+- **Calibration surfaced to the user.** The leave-one-out reference
+  distribution and the shuffle control tell you what scores real family
+  members earn, and whether the metric responds to residue placement at all.
+  Tools in this space generally don't hand you that.
+- **Every decision carries its reason.** `*_rationale.csv` records why each
+  residue was opened or held fixed, which is how the residue-160 case below
+  was found.
+- **No dependencies, one second.** The core runs on the Python standard
+  library, so parameters can be swept locally rather than resubmitted to a
+  server.
+- **Numbering checked rather than assumed**, with the offset verified against
+  a named template sequence inside the alignment.
+
+If you use this in published work, cite the methods above — not this
+repository.
+
 ## Scoring
 
 Each scored residue gets three numbers:
@@ -343,17 +401,58 @@ examples/
 Exploratory research code from a working design campaign, cleaned up and made
 reproducible. It is not a validated predictor — treat the scores as a triage
 filter for prioritizing candidates, not as a prediction of stability or
-activity. Nothing here has been checked against measured data.
+activity. Nothing here has been checked against measured data, and the method
+it implements is established elsewhere (see Relation to existing methods).
 
-## Background reading
+A worthwhile exercise for anyone extending this: run PROSS or FuncLib on the
+same template and diff their design space against `make-resfile`'s, the same
+way `--compare` diffs against a hand-built resfile. Agreement would be real
+validation; disagreement would localise exactly what the missing structural
+term buys.
 
-Not included in this repository (copyrighted); listed for provenance:
+## References
 
-- Chan et al. (2004) — Relationship between local structural entropy and protein thermostability
-- Bae et al. (2008) — Bioinformatic method for protein thermal stabilization by structural entropy optimization
-- Borgo & Havranek (2012) — Automated selection of stabilizing mutations in designed and natural proteins
-- Isakova et al. (2026) — Descent from a common ancestor restricts exploration of protein sequence space
-- Further reading on relative-entropy protein design, evolution-entropy hybrid residue ranking, local entropy in proteins, and thermal stability in plastic-degrading enzymes
+### Methods this reimplements
+
+- Goldenzweig A, *et al.* Automated structure- and sequence-based design of
+  proteins for high bacterial expression and stability. *Mol Cell* 63, 1–10
+  (2016). doi:10.1016/j.molcel.2016.06.012 — **PROSS**
+- Weinstein JJ, Goldenzweig A, Hoch SY, Fleishman SJ. PROSS 2: a new server for
+  the design of stable and highly expressed protein variants. *Bioinformatics*
+  37, 123–125 (2021). doi:10.1093/bioinformatics/btaa1071
+- Peleg Y, *et al.* Community-wide experimental evaluation of the PROSS
+  stability-design method. *J Mol Biol* 433, 166964 (2021).
+  doi:10.1016/j.jmb.2021.166964
+- Khersonsky O, *et al.* Automated design of efficient and functionally diverse
+  enzyme repertoires. *Mol Cell* (2018). PMID:30270109 — **FuncLib**, the
+  closest relative to `make-resfile`
+- Weinstein JY, *et al.* Designed active-site library reveals thousands of
+  functional GFP variants. *Nat Commun* 14, 2890 (2023).
+  doi:10.1038/s41467-023-38099-z — **htFuncLib**
+- Goldenzweig A, Fleishman SJ. Principles of protein stability and their
+  application in computational design. *Annu Rev Biochem* 87, 105–129 (2018).
+  doi:10.1146/annurev-biochem-062917-012102
+
+### Entropy-based design
+
+- Chan CH, *et al.* Relationship between local structural entropy and protein
+  thermostability. *Proteins* (2004)
+- Bae E, *et al.* Bioinformatic method for protein thermal stabilization by
+  structural entropy optimization. (2008)
+- Borgo B, Havranek JJ. Automated selection of stabilizing mutations in
+  designed and natural proteins. (2012)
+
+### Context
+
+- Isakova *et al.* (2026) — Descent from a common ancestor restricts
+  exploration of protein sequence space
+- Further reading in the project notes on relative-entropy protein design,
+  evolution-entropy hybrid residue ranking, local entropy in proteins, and
+  thermal stability in plastic-degrading enzymes
+
+Reference PDFs are not included in this repository (copyrighted). The
+entropy-based entries are given by author, title and year only; fill in journal
+volume and pages from the PDFs before reusing these in a manuscript.
 
 ## License
 
