@@ -1,0 +1,38 @@
+# ─── Large regenerable outputs ───────────────────────────────────────────
+# Stage 2 on the full designed set produces files far over GitHub's 100 MB
+# per-file limit. They are fully reproducible from entropy_pipeline.py.
+results_designed_scores.json
+results_designed_per_position.csv
+results_designed_summary.csv
+results_*_scores.json
+results_*_per_position.csv
+
+# ─── Generated run outputs ──────────────────────────────────────────────
+results_*
+*_profile.json
+*_profile.csv
+*_summary.csv
+!examples/profiles/*
+*.png
+!examples/figures/*.png
+*.xlsx
+
+# ─── Unpublished / licensed material ────────────────────────────────────
+# Reference PDFs are copyrighted; cited in the README instead.
+literature/
+entropy/
+*.pdf
+
+# Designed-variant sequences held back pending publication
+all_sequences.fasta
+all_aligned.fasta
+*.resfile
+
+# ─── Python ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+.DS_Store

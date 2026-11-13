@@ -1,0 +1,11 @@
+# Core pipeline (entropy_pipeline.py natural/designed/both) needs NO
+# third-party packages - it runs on the Python standard library alone.
+# The packages below are only needed for plots and the notebook.
+
+# --plot flag
+matplotlib>=3.7
+numpy>=1.24
+
+# notebook only (sequence-logo cell)
+pandas>=2.0
+logomaker>=0.8
