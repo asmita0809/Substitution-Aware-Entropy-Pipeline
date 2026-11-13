@@ -88,10 +88,10 @@ Spearman correlation between the two rankings is 0.756, and only **45 of the
 legacy top 100 designs remain in the new top 100**. The reordering is real, not
 cosmetic.
 
-`--positions` also takes explicit alignment positions (`80,82,94-99`) or a file
-with one per line. These are **alignment columns, not PDB residue numbers** — a
-Rosetta resfile is written in PDB numbering and must be mapped onto alignment
-columns first.
+`--positions` also takes explicit alignment positions (`80,82,94-99`), a file
+with one per line, or **a Rosetta resfile** — the last of these needs
+`--template` so the residue numbers can be mapped onto columns (see below).
+Bare numbers are alignment columns, not residue numbers.
 
 ## Calibration
 
@@ -128,6 +128,89 @@ A percentile is only meaningful if the reference was built on the same columns
 the designs were scored on. Pass matching `--positions` to both stages, or use
 `both --loo`, which keeps them consistent by construction — a mismatch is
 detected and the annotation skipped rather than silently reported.
+
+## Generating a design space
+
+`make-resfile` runs the logic in reverse. Instead of scoring designs after the
+fact, it turns the entropy profile into a Rosetta resfile that constrains what
+design is allowed to produce in the first place.
+
+```bash
+python entropy_pipeline.py make-resfile \
+    --fasta data/natural_cutinase_msa_22.fasta \
+    --template "P00590" --template-start 1 --chain A \
+    --lock "120,175,188" \
+    --compare seq1.resfile \
+    --out designed
+```
+
+Two decisions, taken from two different parts of the profile:
+
+- **Entropy picks the mode.** `norm_H` at or below `--conserved-max-h` (default
+  0.15) means the position is held at the native residue; above it, the
+  position is designed.
+- **The distribution picks the alphabet.** Amino acids are admitted in
+  descending natural probability until the cumulative mass reaches `--top-p`
+  (default 0.90). Set sizes then follow each column's own tolerance instead of
+  a fixed threshold giving one residue here and fifteen there. The template's
+  native residue is always included.
+
+Cysteines are held fixed by default (`--no-lock-cys` to override), since
+mutating one half of a disulfide is rarely intended, and `--lock` pins
+mechanistically essential residues — a catalytic triad — regardless of entropy.
+
+Output is the resfile plus `*_rationale.csv`, one row per template residue
+recording the mode, the alphabet, the entropy and *why* that decision was made.
+
+### Numbering is the thing that will break
+
+A wrong offset fails silently: Rosetta constrains the wrong residue at every
+position and reports nothing. So the map is always built from a named sequence
+inside the alignment, never assumed — `--template` takes a header substring and
+`--template-start` the residue number of its first non-gap residue.
+
+The cutinase case shows why this needs care. The template is in the alignment as
+`sp|P00590|CUTI1_FUSVN`, the 230-residue precursor, and matches the 1CEX
+deposited sequence at **99.5% identity with a +16 offset** — 1CEX begins at
+precursor residue 17, after the signal peptide. So a residue number quoted in
+one convention is 16 off in the other, and a catalytic position quoted from a
+paper in mature numbering is off by about 31. Confirm `--template-start`
+against the ATOM records of the PDB you will actually pass Rosetta; an RCSB
+FASTA gives SEQRES order, which need not match author numbering.
+
+### Validate against a resfile you trust
+
+`--compare` diffs the generated specification against an existing one. On the
+22-sequence cutinase alignment against a hand-built `seq1.resfile`:
+
+| | |
+|---|---|
+| reference positions mapped | **193 / 193** |
+| same command | 157 / 193 (81%) |
+| manual alphabet ⊆ generated | **144 / 157 (92%)** |
+| mean alphabet size | manual 2.1, generated 4.3 |
+
+Every reference position mapped, which is the check that the numbering is
+right — a bad offset leaves orphans. The generator is roughly twice as
+permissive as the manual file at `--top-p 0.90`; lower it to tighten.
+
+The comparison also flags a resfile whose header has a **commented-out default
+command** (`#NATRO`). That leaves unlisted residues falling through to Rosetta's
+own default, where they are designable to any amino acid — usually the opposite
+of what was meant.
+
+### The circularity trap
+
+If you generate a resfile from profile P and then score the resulting designs
+with profile P, **the designs score well by construction** — you constrained
+them to. The scoring stage stops being a validation and becomes a tautology
+that looks like success.
+
+Constraint and evaluation have to draw on different information. Either split
+the homologs into disjoint sets, building the resfile from one and calibrating
+against the other, or evaluate with something orthogonal: an ESM or ProteinMPNN
+likelihood, Rosetta energy, or measured data. Decide this before generating
+anything, because it is hard to retrofit.
 
 ## Install
 
@@ -198,6 +281,8 @@ silently yields zero designs.
 | `*_profile.csv` | Same, flat: `position, gap_frac, n_seqs, scorable, H_bits, norm_H, freq_*, blosum_*` |
 | `*_summary.csv` | One row per sequence: mean/sum/max/min of each metric, plus calibration fields |
 | `*_calibration.json` | Leave-one-out distribution, per-fold scores, shuffle null |
+| `*.resfile` | Rosetta design specification (`make-resfile`) |
+| `*_rationale.csv` | Per-residue mode, alphabet, entropy and reason |
 | `*_scores.json` | Full per-residue scores — **`--per-position` only** |
 | `*_per_position.csv` | Long-format per-residue table — **`--per-position` only** |
 

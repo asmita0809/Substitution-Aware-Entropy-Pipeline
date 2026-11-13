@@ -243,7 +243,11 @@ def save_natural_profile(profile: list[dict], prefix: str) -> str:
 # Column selection — gap filtering and designable-position subsetting
 # ══════════════════════════════════════════════════════════════════════════
 
-def parse_positions(spec: str | None, n_cols: int) -> set[int] | None:
+def parse_positions(
+    spec:   str | None,
+    n_cols: int,
+    tmap:   "TemplateMap | None" = None,
+) -> set[int] | None:
     """
     Parse a --positions argument into a set of 0-based column indices.
 
@@ -253,10 +257,13 @@ def parse_positions(spec: str | None, n_cols: int) -> set[int] | None:
                          which is the usual choice for a design set
       "80,82,94-99"    → explicit 1-based ALIGNMENT positions
       path/to/file.txt → one 1-based position per line, '#' comments ok
+      path/to/x.resfile→ a Rosetta resfile; its designable positions are
+                         mapped onto alignment columns via `tmap`, which
+                         therefore has to be supplied (--template)
 
-    These are alignment column numbers, not PDB residue numbers. A Rosetta
-    resfile is written in PDB numbering and cannot be passed here directly —
-    map it onto alignment columns first.
+    Bare numbers are alignment column numbers, not residue numbers. A
+    resfile is in the template's residue numbering, so it is only usable
+    once a TemplateMap pins the two together.
     """
     if spec is None:
         return None
@@ -266,6 +273,37 @@ def parse_positions(spec: str | None, n_cols: int) -> set[int] | None:
 
     text = spec
     path = Path(spec)
+
+    if path.exists() and looks_like_resfile(path):
+        if tmap is None:
+            raise ValueError(
+                f"{spec} looks like a Rosetta resfile, which is written in "
+                "residue numbering. Pass --template (the template's header in "
+                "the alignment) so the residue numbers can be mapped onto "
+                "alignment columns."
+            )
+        rows = parse_resfile(path)
+        designable = {
+            r for r, (_chain, cmd, _aas) in rows.items()
+            if cmd in ("PIKAA", "NOTAA", "ALLAA", "ALLAAwc", "ALLAAxc",
+                       "POLAR", "APOLAR")
+        }
+        cols    = {tmap.res_to_col[r] for r in designable if r in tmap.res_to_col}
+        missing = sorted(r for r in designable if r not in tmap.res_to_col)
+        print(f"  Resfile {path.name}: {len(rows)} entries, "
+              f"{len(designable)} designable → {len(cols)} alignment columns")
+        if missing:
+            lo, hi = tmap.res_range
+            print(f"    !! {len(missing)} residue numbers are outside the "
+                  f"template ({lo}-{hi}): {missing[:8]}")
+            print( "       Check --template-start against the PDB numbering.")
+        if not cols:
+            raise ValueError(
+                "No resfile position mapped onto the template. The numbering "
+                "offset is almost certainly wrong — check --template-start."
+            )
+        return cols
+
     if path.exists():
         text = ",".join(
             line.split()[0]
@@ -675,6 +713,324 @@ def shuffle_null(
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Template mapping — alignment columns ↔ structure residue numbers
+# ══════════════════════════════════════════════════════════════════════════
+
+class TemplateMap:
+    """
+    Two-way map between alignment columns and the template's residue numbers.
+
+    Everything downstream of a resfile depends on this being right, and a
+    wrong offset fails silently: Rosetta constrains the wrong residue at
+    every position and reports no error. So the map is always built from a
+    named sequence inside the alignment itself, never assumed.
+
+    `start` is the residue number of the template's FIRST non-gap residue.
+    Note that a PDB entry's author numbering need not match the order of
+    its SEQRES records, and an RCSB FASTA gives the latter. Confirm `start`
+    against the ATOM records of the PDB that Rosetta will read.
+    """
+
+    def __init__(self, header: str, aligned_seq: str, start: int = 1,
+                 chain: str = "A"):
+        self.header     = header
+        self.aligned    = aligned_seq
+        self.chain      = chain
+        self.start      = start
+        self.col_to_res: dict[int, int] = {}
+        self.res_to_col: dict[int, int] = {}
+        self.native:     dict[int, str] = {}
+
+        resnum = start - 1
+        for col, ch in enumerate(aligned_seq):
+            if ch in GAP_CHARS:
+                continue
+            resnum += 1
+            self.col_to_res[col] = resnum
+            self.res_to_col[resnum] = col
+            self.native[col] = ch.upper()
+
+    @property
+    def n_residues(self) -> int:
+        return len(self.col_to_res)
+
+    @property
+    def res_range(self) -> tuple[int, int]:
+        nums = sorted(self.res_to_col)
+        return (nums[0], nums[-1]) if nums else (0, 0)
+
+    def describe(self):
+        lo, hi = self.res_range
+        print(f"  Template            : {self.header[:60]}")
+        print(f"  Template residues   : {self.n_residues}  "
+              f"(numbered {lo}-{hi}, chain {self.chain})")
+
+
+def find_template(
+    records: list[tuple[str, str]],
+    needle:  str,
+) -> tuple[str, str]:
+    """
+    Locate the template sequence in the alignment by a header substring.
+
+    Ambiguity is an error rather than a guess: picking the wrong one of two
+    near-identical homologs would shift the whole numbering.
+    """
+    hits = [(h, s) for h, s in records if needle.lower() in h.lower()]
+    if not hits:
+        raise ValueError(
+            f"--template {needle!r} matched no sequence header in the "
+            f"alignment. Headers present:\n  " +
+            "\n  ".join(h[:70] for h, _ in records[:8]) +
+            ("\n  ..." if len(records) > 8 else "")
+        )
+    if len(hits) > 1:
+        raise ValueError(
+            f"--template {needle!r} matched {len(hits)} sequences; make it "
+            f"specific:\n  " + "\n  ".join(h[:70] for h, _ in hits[:8])
+        )
+    return hits[0]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Resfile I/O
+# ══════════════════════════════════════════════════════════════════════════
+
+RESFILE_COMMANDS = {
+    "PIKAA", "NOTAA", "NATAA", "NATRO", "ALLAA", "ALLAAwc", "ALLAAxc",
+    "POLAR", "APOLAR", "EX",
+}
+
+
+def looks_like_resfile(path: Path) -> bool:
+    head = path.read_text(errors="replace")[:4000].upper()
+    return "START" in head and any(c in head for c in ("PIKAA", "NATAA", "NATRO", "ALLAA"))
+
+
+def parse_resfile(path: str | Path) -> dict[int, tuple[str, str, str]]:
+    """
+    Read a Rosetta resfile into {resnum: (chain, command, allowed_aas)}.
+
+    Only the per-residue body after 'start' is read. The header block
+    (default commands) is returned separately by read_resfile_default.
+    """
+    rows: dict[int, tuple[str, str, str]] = {}
+    started = False
+    for raw in Path(path).read_text(errors="replace").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if not started:
+            if line.lower() == "start":
+                started = True
+            continue
+        parts = line.split()
+        if len(parts) < 3 or not parts[0].lstrip("-").isdigit():
+            continue
+        resnum, chain, cmd = int(parts[0]), parts[1], parts[2].upper()
+        aas = parts[3].upper() if len(parts) > 3 else ""
+        rows[resnum] = (chain, cmd, aas)
+    return rows
+
+
+def read_resfile_default(path: str | Path) -> str | None:
+    """
+    The default command that applies to residues NOT listed in the body.
+
+    This is easy to get wrong and expensive when wrong: a resfile whose
+    header reads '#NATRO' has that default COMMENTED OUT, so unlisted
+    residues fall through to Rosetta's own default of designing them to
+    any amino acid — the opposite of the intent.
+    """
+    for raw in Path(path).read_text(errors="replace").splitlines():
+        stripped = raw.strip()
+        if stripped.lower() == "start":
+            return None
+        line = stripped.split("#", 1)[0].strip()
+        if line and line.split()[0].upper() in RESFILE_COMMANDS:
+            return line
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Resfile generation from the entropy profile
+# ══════════════════════════════════════════════════════════════════════════
+
+def nucleus_alphabet(
+    dist:   dict[str, float],
+    top_p:  float,
+    min_aa: int,
+    max_aa: int,
+    native: str | None = None,
+) -> tuple[list[str], float]:
+    """
+    The smallest set of amino acids whose natural probability sums to top_p.
+
+    A fixed probability threshold gives erratic set sizes — one residue at a
+    conserved column, fifteen at a variable one. Taking a cumulative mass
+    instead lets the set size follow the column's own tolerance, which is
+    the quantity of interest.
+
+    The template's native residue is always included: excluding it would let
+    Rosetta be forced off a wild-type residue that is known to work.
+    """
+    ranked = sorted(AA_ORDER, key=lambda a: -dist.get(a, 0.0))
+    chosen, cum = [], 0.0
+    for aa in ranked:
+        chosen.append(aa)
+        cum += dist.get(aa, 0.0)
+        if cum >= top_p and len(chosen) >= min_aa:
+            break
+    if len(chosen) > max_aa:
+        chosen = chosen[:max_aa]
+        cum = sum(dist.get(a, 0.0) for a in chosen)
+    if native and native in AA_SET and native not in chosen:
+        chosen.append(native)
+    chosen.sort(key=lambda a: -dist.get(a, 0.0))
+    return chosen, cum
+
+
+def build_resfile(
+    profile:        list[dict],
+    tmap:           TemplateMap,
+    conserved_max_h: float = 0.15,
+    top_p:          float = 0.90,
+    min_aa:         int = 1,
+    max_aa:         int = 20,
+    lock:           set[int] | None = None,
+    lock_cys:       bool = True,
+) -> list[dict]:
+    """
+    Turn the entropy profile into a per-residue design specification.
+
+    Entropy chooses the MODE — whether a position is designed at all.
+    The distribution chooses the ALPHABET — what is permitted where it is.
+    """
+    lock = lock or set()
+    decisions = []
+
+    for col, prof in enumerate(profile):
+        if col not in tmap.col_to_res:
+            continue                       # template has a gap here
+        resnum = tmap.col_to_res[col]
+        native = tmap.native[col]
+        norm_H = prof["norm_H"]
+
+        if resnum in lock:
+            mode, aas, reason = "NATAA", "", "locked by --lock"
+        elif lock_cys and native == "C":
+            mode, aas, reason = "NATAA", "", "cysteine (possible disulfide)"
+        elif not prof.get("scorable", True):
+            mode, aas, reason = "NATAA", "", f"gappy column ({prof['gap_frac']:.2f})"
+        elif norm_H <= conserved_max_h:
+            mode, aas, reason = "NATAA", "", f"conserved (norm_H {norm_H:.3f})"
+        else:
+            alpha, cum = nucleus_alphabet(
+                prof["blosum_dist"], top_p, min_aa, max_aa, native
+            )
+            if len(alpha) <= 1:
+                mode, aas, reason = "NATAA", "", "single residue tolerated"
+            else:
+                mode, aas = "PIKAA", "".join(alpha)
+                reason = f"top_p {cum:.2f}, {len(alpha)} aa"
+
+        decisions.append({
+            "resnum":   resnum,
+            "col":      col,
+            "position": col + 1,
+            "chain":    tmap.chain,
+            "native":   native,
+            "norm_H":   round(norm_H, 6),
+            "gap_frac": prof["gap_frac"],
+            "command":  mode,
+            "allowed":  aas,
+            "n_allowed": len(aas) if aas else 1,
+            "reason":   reason,
+        })
+    return decisions
+
+
+def write_resfile(decisions: list[dict], path: str, default_cmd: str = "NATRO") -> None:
+    with open(path, "w") as f:
+        f.write("# generated by entropy_pipeline.py make-resfile\n")
+        f.write("# entropy chooses the mode, the natural distribution the alphabet\n")
+        f.write("# verify residue numbering against the PDB that Rosetta will read\n")
+        f.write(f"{default_cmd}\n")
+        f.write("start\n")
+        for d in decisions:
+            if d["command"] == "PIKAA":
+                f.write(f"{d['resnum']:<4d} {d['chain']}  PIKAA  {d['allowed']}\n")
+            else:
+                f.write(f"{d['resnum']:<4d} {d['chain']}  {d['command']}\n")
+    print(f"  ✓ Resfile → {path}")
+
+
+def write_resfile_report(decisions: list[dict], path: str) -> None:
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(decisions[0].keys()))
+        w.writeheader()
+        w.writerows(decisions)
+    print(f"  ✓ Per-residue rationale → {path}")
+
+
+def compare_resfiles(decisions: list[dict], reference: str) -> None:
+    """
+    Diff a generated specification against a hand-built one.
+
+    Agreement is evidence the generator works; disagreement says either the
+    generator or the manual choice is wrong, and both are worth knowing.
+    Containment is the more informative direction: if the manual alphabet
+    sits inside the generated one, the generator is permissive enough to
+    have allowed every choice that was actually made by hand.
+    """
+    ref = parse_resfile(reference)
+    gen = {d["resnum"]: (d["command"], d["allowed"]) for d in decisions}
+    dflt = read_resfile_default(reference)
+
+    print("\n  ───────────────────────────────────────────────────────")
+    print(f"  Comparison against {reference}")
+    print("  ───────────────────────────────────────────────────────")
+    print(f"  Reference positions : {len(ref)}")
+    print(f"  Generated positions : {len(gen)}")
+
+    if dflt is None:
+        print("  !! The reference sets no default command before 'start', so")
+        print("     residues it does not list fall through to Rosetta's own")
+        print("     default and are designable to any amino acid. If the header")
+        print("     has a commented-out '#NATRO', that is likely unintended.")
+    else:
+        print(f"  Reference default   : {dflt}")
+
+    both  = sorted(set(ref) & set(gen))
+    print(f"  In both             : {len(both)}")
+    print(f"  Reference only      : {len(set(ref) - set(gen))}")
+    print(f"  Generated only      : {len(set(gen) - set(ref))}")
+    if not both:
+        print("  No shared positions — the numbering almost certainly differs.")
+        print("  ───────────────────────────────────────────────────────")
+        return
+
+    same_mode = sum(1 for r in both if ref[r][1] == gen[r][0])
+    print(f"  Same command        : {same_mode}/{len(both)} "
+          f"({100*same_mode/len(both):.0f}%)")
+
+    pairs = [(set(ref[r][2]), set(gen[r][1])) for r in both
+             if ref[r][1] == "PIKAA" and gen[r][0] == "PIKAA"]
+    if pairs:
+        jac = [len(a & b) / len(a | b) for a, b in pairs if a | b]
+        print(f"  PIKAA on both sides : {len(pairs)}")
+        print(f"    mean overlap      : {sum(jac)/len(jac):.2f} (Jaccard)")
+        print(f"    manual ⊆ generated: {sum(1 for a,b in pairs if a <= b)}"
+              f"/{len(pairs)}")
+        print(f"    generated ⊆ manual: {sum(1 for a,b in pairs if b <= a)}"
+              f"/{len(pairs)}")
+        ref_sz = sum(len(a) for a, _ in pairs) / len(pairs)
+        gen_sz = sum(len(b) for _, b in pairs) / len(pairs)
+        print(f"    mean alphabet size: manual {ref_sz:.1f}  generated {gen_sz:.1f}")
+    print("  ───────────────────────────────────────────────────────")
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Plotting
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -919,7 +1275,22 @@ def _report_calibration(calib: dict, shuf: dict | None = None):
     print("  ───────────────────────────────────────────────────────")
 
 
-def _resolve_cols_for_designs(profile, designed, args):
+def _build_tmap(records, args):
+    """Build a TemplateMap if --template was given, else None."""
+    needle = getattr(args, "template", None)
+    if not needle:
+        return None
+    header, seq = find_template(records, needle)
+    tmap = TemplateMap(
+        header, seq,
+        start=getattr(args, "template_start", 1),
+        chain=getattr(args, "chain", "A"),
+    )
+    tmap.describe()
+    return tmap
+
+
+def _resolve_cols_for_designs(profile, designed, args, tmap=None):
     """Work out which columns to score, honouring --positions."""
     spec = getattr(args, "positions", None)
     if spec is not None and spec.strip().lower() == "auto":
@@ -932,7 +1303,7 @@ def _resolve_cols_for_designs(profile, designed, args):
         else:
             positions = varied
     else:
-        positions = parse_positions(spec, len(profile))
+        positions = parse_positions(spec, len(profile), tmap)
     return resolve_scoring_columns(profile, positions)
 
 
@@ -978,7 +1349,8 @@ def cmd_designed(args):
     natural, designed = split_combined(all_records, args.design_prefix)
     print_split_report(natural, designed, args.design_prefix)
 
-    cols = _resolve_cols_for_designs(profile, designed, args)
+    tmap = _build_tmap(all_records, args)
+    cols = _resolve_cols_for_designs(profile, designed, args, tmap)
 
     all_results = score_all_designed(
         designed, profile, args.out, cols, args.per_position
@@ -1056,7 +1428,8 @@ def cmd_both(args):
     natural, designed = split_combined(all_records, args.design_prefix)
     print_split_report(natural, designed, args.design_prefix)
 
-    cols = _resolve_cols_for_designs(profile, designed, args)
+    tmap = _build_tmap(nat_records, args)
+    cols = _resolve_cols_for_designs(profile, designed, args, tmap)
 
     all_results = score_all_designed(
         designed, profile, args.out, cols, args.per_position
@@ -1096,6 +1469,78 @@ def cmd_both(args):
 
     if args.plot:
         plot_designed_scores(all_results, profile, args.out)
+
+
+def cmd_make_resfile(args):
+    print(f"\n[make-resfile] Natural alignment: {args.fasta}")
+    records = read_fasta(args.fasta)
+    print(f"  Loaded {len(records)} sequences  |  alignment length {len(records[0][1])}")
+
+    header, seq = find_template(records, args.template)
+    tmap = TemplateMap(header, seq, start=args.template_start, chain=args.chain)
+    tmap.describe()
+
+    if args.profile:
+        print(f"  Reusing profile     : {args.profile}")
+        with open(args.profile) as f:
+            profile = json.load(f)
+        if len(profile) != len(records[0][1]):
+            raise ValueError(
+                f"Profile has {len(profile)} columns but the alignment has "
+                f"{len(records[0][1])}. They must come from the same alignment."
+            )
+    else:
+        profile = compute_natural_profile(records, max_gap_frac=args.max_gap_frac)
+
+    lock = set()
+    if args.lock:
+        lock = {int(x) for x in args.lock.replace(" ", "").split(",") if x}
+        outside = sorted(r for r in lock if r not in tmap.res_to_col)
+        if outside:
+            lo, hi = tmap.res_range
+            print(f"  !! --lock lists residues outside the template "
+                  f"({lo}-{hi}): {outside}")
+
+    decisions = build_resfile(
+        profile, tmap,
+        conserved_max_h=args.conserved_max_h,
+        top_p=args.top_p,
+        min_aa=args.min_aa,
+        max_aa=args.max_aa,
+        lock=lock,
+        lock_cys=not args.no_lock_cys,
+    )
+
+    n_design = sum(1 for d in decisions if d["command"] == "PIKAA")
+    n_fixed  = len(decisions) - n_design
+    sizes    = [d["n_allowed"] for d in decisions if d["command"] == "PIKAA"]
+
+    print("\n  ───────────────────────────────────────────────────────")
+    print("  Design space")
+    print("  ───────────────────────────────────────────────────────")
+    print(f"  Template residues   : {len(decisions)}")
+    print(f"  Designable (PIKAA)  : {n_design}")
+    print(f"  Held fixed (NATAA)  : {n_fixed}")
+    if sizes:
+        print(f"  Alphabet size       : mean {sum(sizes)/len(sizes):.1f}  "
+              f"min {min(sizes)}  max {max(sizes)}")
+        log10 = sum(math.log10(s) for s in sizes)
+        print(f"  Sequence space      : ~1e{log10:.0f}")
+    reasons = Counter(d["reason"].split("(")[0].split(",")[0].strip()
+                      for d in decisions if d["command"] != "PIKAA")
+    for why, n in reasons.most_common():
+        print(f"    fixed: {why:<32s} {n}")
+    print("  ───────────────────────────────────────────────────────")
+
+    out = args.out if args.out.endswith(".resfile") else f"{args.out}.resfile"
+    write_resfile(decisions, out, default_cmd=args.default_command)
+    write_resfile_report(decisions, out.replace(".resfile", "_rationale.csv"))
+
+    if args.compare:
+        compare_resfiles(decisions, args.compare)
+
+    print("\n  Before running Rosetta: confirm the residue numbering above")
+    print("  matches the ATOM records of the PDB you will pass it.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1169,6 +1614,13 @@ def main():
         help="Also write the full per-residue scores JSON and long-format\n"
              "CSV. These scale as sequences x columns and reach hundreds of\n"
              "megabytes for a few thousand designs, so they are off by default.")
+    p2.add_argument("--template", default=None,
+        help="Substring of the template sequence's header in the alignment\n"
+             "(e.g. 'P00590'). Required to use a resfile with --positions.")
+    p2.add_argument("--template-start", type=int, default=1,
+        help="Residue number of the template's first non-gap residue\n"
+             "(default: 1). Must match the PDB numbering Rosetta will read.")
+
 
     # ── both ──
     p3 = sub.add_parser("both",
@@ -1201,9 +1653,70 @@ def main():
              "every design with its standing against that distribution.")
     p3.add_argument("--per-position", action="store_true",
         help="Also write the large per-residue JSON and CSV outputs.")
+    p3.add_argument("--template", default=None,
+        help="Substring of the template sequence's header in the alignment\n"
+             "(e.g. 'P00590'). Required to use a resfile with --positions.")
+    p3.add_argument("--template-start", type=int, default=1,
+        help="Residue number of the template's first non-gap residue\n"
+             "(default: 1). Must match the PDB numbering Rosetta will read.")
+
+
+    # ── make-resfile ──
+    p4 = sub.add_parser("make-resfile",
+        help="Turn the entropy profile into a Rosetta resfile")
+    p4.add_argument("--fasta", required=True,
+        help="MAFFT-aligned natural sequences, INCLUDING the template")
+    p4.add_argument("--template", required=True,
+        help="Substring of the template sequence's header in the alignment\n"
+             "(e.g. 'P00590'). The template must be in the alignment so the\n"
+             "column-to-residue map is derived rather than assumed.")
+    p4.add_argument("--template-start", type=int, default=1,
+        help="Residue number of the template's first non-gap residue\n"
+             "(default: 1). Confirm against the ATOM records of the PDB\n"
+             "Rosetta will read — an RCSB FASTA gives SEQRES order, which\n"
+             "need not match author numbering.")
+    p4.add_argument("--chain", default="A",
+        help="Chain identifier written into the resfile  (default: A)")
+    p4.add_argument("--profile", default=None,
+        help="Reuse an existing *_profile.json instead of recomputing.\n"
+             "Must come from the same alignment.")
+    p4.add_argument("--out", default="designed",
+        help="Output path; '.resfile' is appended if absent  (default: designed)")
+    p4.add_argument("--max-gap-frac", type=float, default=0.3,
+        help="Columns gappier than this are held fixed  (default: 0.3)")
+    p4.add_argument("--conserved-max-h", type=float, default=0.15,
+        help="Hold a position fixed when its normalised entropy is at or\n"
+             "below this. Raise it to design more conservatively, lower it\n"
+             "to open up more positions.  (default: 0.15)")
+    p4.add_argument("--top-p", type=float, default=0.90,
+        help="Allow the smallest set of amino acids whose natural\n"
+             "probability sums to this  (default: 0.90)")
+    p4.add_argument("--min-aa", type=int, default=1,
+        help="Minimum alphabet size at a designed position  (default: 1)")
+    p4.add_argument("--max-aa", type=int, default=20,
+        help="Maximum alphabet size at a designed position  (default: 20)")
+    p4.add_argument("--lock", default=None,
+        help="Comma-separated residue numbers to hold fixed regardless of\n"
+             "entropy — the catalytic triad, anything mechanistically\n"
+             "essential. In the template's numbering, so verify it against\n"
+             "the structure rather than taking numbers from a paper.")
+    p4.add_argument("--no-lock-cys", action="store_true",
+        help="Allow design at cysteines. Off by default, since mutating one\n"
+             "half of a disulfide is rarely intended.")
+    p4.add_argument("--default-command", default="NATRO",
+        help="Default command for residues not listed  (default: NATRO).\n"
+             "Written uncommented: a commented-out default silently lets\n"
+             "Rosetta design every unlisted residue.")
+    p4.add_argument("--compare", default=None,
+        help="An existing resfile to diff the generated one against")
 
     args = parser.parse_args()
-    {"natural": cmd_natural, "designed": cmd_designed, "both": cmd_both}[args.cmd](args)
+    {
+        "natural":      cmd_natural,
+        "designed":     cmd_designed,
+        "both":         cmd_both,
+        "make-resfile": cmd_make_resfile,
+    }[args.cmd](args)
     print("Done.\n")
 
 
