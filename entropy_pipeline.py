@@ -50,6 +50,7 @@ import json
 import math
 import sys
 from collections import Counter
+from pathlib import Path
 
 # ── BLOSUM62 ───────────────────────────────────────────────────────────────
 AA_ORDER = list("ARNDCQEGHILKMFPSTWYV")
@@ -161,9 +162,18 @@ def shannon_entropy(probs: list[float]) -> float:
     return -sum(p * math.log2(p) for p in probs if p > 1e-12)
 
 
-def compute_natural_profile(records: list[tuple[str, str]]) -> list[dict]:
+def compute_natural_profile(
+    records:      list[tuple[str, str]],
+    max_gap_frac: float = 1.0,
+) -> list[dict]:
     """
     Compute per-column entropy profile from aligned natural sequences.
+
+    max_gap_frac marks columns as unreliable rather than removing them:
+    a column where most natural sequences carry a gap has its
+    distribution estimated from a handful of residues, and will happily
+    emit the largest penalties in a run from pure sampling noise. Such
+    columns get scorable=False and are skipped during scoring.
     """
     if not records:
         raise ValueError("No natural sequences found.")
@@ -194,6 +204,7 @@ def compute_natural_profile(records: list[tuple[str, str]]) -> list[dict]:
             "position":    col + 1,
             "gap_frac":    round(gap_frac,  6),
             "n_seqs":      len(col_aas),
+            "scorable":    bool(gap_frac <= max_gap_frac),
             "freq_dist":   freq_dist,
             "blosum_dist": {aa: round(p, 8) for aa, p in zip(AA_ORDER, mixed_dist)},
             "H_bits":      round(H,      8),
@@ -213,13 +224,14 @@ def save_natural_profile(profile: list[dict], prefix: str) -> str:
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(
-            ["position", "gap_frac", "n_seqs", "H_bits", "norm_H"] +
+            ["position", "gap_frac", "n_seqs", "scorable", "H_bits", "norm_H"] +
             [f"freq_{aa}"   for aa in AA_ORDER] +
             [f"blosum_{aa}" for aa in AA_ORDER]
         )
         for c in profile:
             w.writerow(
-                [c["position"], c["gap_frac"], c["n_seqs"], c["H_bits"], c["norm_H"]] +
+                [c["position"], c["gap_frac"], c["n_seqs"],
+                 int(c.get("scorable", True)), c["H_bits"], c["norm_H"]] +
                 [round(c["freq_dist"].get(aa,   0), 6) for aa in AA_ORDER] +
                 [round(c["blosum_dist"].get(aa, 0), 8) for aa in AA_ORDER]
             )
@@ -228,31 +240,153 @@ def save_natural_profile(profile: list[dict], prefix: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Column selection — gap filtering and designable-position subsetting
+# ══════════════════════════════════════════════════════════════════════════
+
+def parse_positions(spec: str | None, n_cols: int) -> set[int] | None:
+    """
+    Parse a --positions argument into a set of 0-based column indices.
+
+    Accepted forms:
+      None / "all"     → None  (score every column)
+      "auto"           → None here; resolved from the designed records,
+                         which is the usual choice for a design set
+      "80,82,94-99"    → explicit 1-based ALIGNMENT positions
+      path/to/file.txt → one 1-based position per line, '#' comments ok
+
+    These are alignment column numbers, not PDB residue numbers. A Rosetta
+    resfile is written in PDB numbering and cannot be passed here directly —
+    map it onto alignment columns first.
+    """
+    if spec is None:
+        return None
+    key = spec.strip().lower()
+    if key in ("auto", "all", ""):
+        return None
+
+    text = spec
+    path = Path(spec)
+    if path.exists():
+        text = ",".join(
+            line.split()[0]
+            for line in path.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+
+    cols: set[int] = set()
+    for chunk in text.replace(" ", "").split(","):
+        if not chunk:
+            continue
+        if "-" in chunk.lstrip("-"):
+            lo, hi = chunk.split("-", 1)
+            cols.update(range(int(lo) - 1, int(hi)))
+        else:
+            cols.add(int(chunk) - 1)
+
+    bad = sorted(c + 1 for c in cols if not 0 <= c < n_cols)
+    if bad:
+        raise ValueError(
+            f"--positions lists positions outside the alignment (1-{n_cols}): "
+            f"{bad[:10]}"
+        )
+    return cols
+
+
+def detect_variable_columns(records: list[tuple[str, str]]) -> set[int]:
+    """
+    Columns at which the supplied sequences differ from one another.
+
+    For a fixed-backbone design set this recovers the designable positions.
+    Every other column holds the same residue in every sequence, so it adds
+    an identical constant to each per-sequence mean — padding the average
+    and shrinking the spread between designs without carrying any signal.
+    """
+    if not records:
+        return set()
+    seqs = [s for _, s in records]
+    n    = min(len(s) for s in seqs)
+    return {col for col in range(n) if len({s[col] for s in seqs}) > 1}
+
+
+def resolve_scoring_columns(
+    profile:   list[dict],
+    positions: set[int] | None,
+    quiet:     bool = False,
+) -> list[int]:
+    """
+    Intersect the requested subset with the columns the profile considers
+    reliable, and say out loud what was dropped.
+    """
+    n_cols   = len(profile)
+    wanted   = set(range(n_cols)) if positions is None else set(positions)
+    scorable = {c for c in wanted if profile[c].get("scorable", True)}
+    dropped  = sorted(wanted - scorable)
+
+    if not quiet:
+        print(f"  Scoring columns     : {len(scorable)} of {n_cols}")
+        if positions is not None:
+            print(f"    requested subset  : {len(wanted)}")
+        if dropped:
+            shown = ", ".join(str(profile[c]["position"]) for c in dropped[:12])
+            more  = f"  +{len(dropped) - 12} more" if len(dropped) > 12 else ""
+            print(f"    dropped as gappy  : {len(dropped)}  [{shown}{more}]")
+
+    if not scorable:
+        raise ValueError(
+            "No scorable columns remain. Raise --max-gap-frac or widen --positions."
+        )
+    return sorted(scorable)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Stage 2 — Designed sequence penalty scoring
 # ══════════════════════════════════════════════════════════════════════════
 
-def score_designed_sequence(seq: str, profile: list[dict]) -> list[dict]:
+def score_designed_sequence(
+    seq:     str,
+    profile: list[dict],
+    cols:    list[int] | None = None,
+) -> list[dict]:
     """
-    Score every non-gap residue of a designed sequence.
+    Score the residues of a designed sequence against the natural profile.
+
+    `cols` restricts scoring to a list of 0-based alignment columns (see
+    resolve_scoring_columns). Passing None scores every column, which
+    reproduces the original behaviour.
 
     Metric A — entropy lookup:
         penalty_A = norm_H of that alignment column
-        Low  → conserved position in nature  (high constraint on design)
-        High → variable position in nature   (low constraint)
+
+        Careful: metric A is a property of the COLUMN and does not depend
+        on which residue the design placed there. Across a design set that
+        shares one gap pattern it is the same constant for every sequence
+        and so carries no ranking information whatsoever. It is reported
+        for inspection; rank on penalty_weighted instead.
 
     Metric B — distribution deviation:
         penalty_B = -log2( P(designed_AA | BLOSUM62-smoothed natural dist) )
-                    normalised by log2(20) → [0, ~1]
-        Low  → designed AA well-supported by natural substitution patterns
-        High → designed AA is unexpected / unusual
+                    divided by log2(20)
 
-    Combined = mean(A, B)
+        Not bounded by 1. P is floored at 1e-8, so penalty_B can reach
+        about 6.1 for a residue the family never tolerates.
+
+    Weighted penalty — recommended for ranking:
+        penalty_weighted = (1 - norm_H) * penalty_B
+
+        The same substitution costs more at a conserved column than at a
+        variable one. This is what metric A was reaching for; multiplying
+        expresses it, whereas adding merely offsets every design equally.
+
+    Combined = mean(A, B), retained only for comparability with earlier runs.
     """
+    iter_cols = range(len(profile)) if cols is None else cols
+
     scores = []
-    for col, prof in enumerate(profile):
-        if col >= len(seq):
-            break
-        aa = seq[col]
+    for col in iter_cols:
+        if col >= len(seq) or col >= len(profile):
+            continue
+        prof = profile[col]
+        aa   = seq[col]
         if aa in GAP_CHARS:
             continue
 
@@ -263,6 +397,7 @@ def score_designed_sequence(seq: str, profile: list[dict]) -> list[dict]:
         neg_log_p     = -math.log2(p_aa)
         norm_neg_logp = neg_log_p / MAX_ENTROPY
         combined      = (norm_H + norm_neg_logp) / 2.0
+        weighted      = (1.0 - norm_H) * norm_neg_logp
 
         scores.append({
             "col":                        col,
@@ -272,8 +407,9 @@ def score_designed_sequence(seq: str, profile: list[dict]) -> list[dict]:
             "H_bits":                     prof["H_bits"],
             "penalty_A_entropy_lookup":   round(norm_H,          6),
             "penalty_B_distribution_dev": round(norm_neg_logp,   6),
-            "combined_penalty":           round(combined,         6),
-            "p_aa_in_natural":            round(p_aa,             8),
+            "penalty_weighted":           round(weighted,        6),
+            "combined_penalty":           round(combined,        6),
+            "p_aa_in_natural":            round(p_aa,            8),
         })
     return scores
 
@@ -284,6 +420,7 @@ def aggregate_scores(scores: list[dict]) -> dict:
     keys = [
         "penalty_A_entropy_lookup",
         "penalty_B_distribution_dev",
+        "penalty_weighted",
         "combined_penalty",
     ]
     return {
@@ -296,16 +433,27 @@ def aggregate_scores(scores: list[dict]) -> dict:
 
 
 def score_sequence_group(
-    records: list[tuple[str, str]],
-    profile: list[dict],
-    prefix:  str,
-    group:   str,
+    records:      list[tuple[str, str]],
+    profile:      list[dict],
+    prefix:       str,
+    group:        str,
+    cols:         list[int] | None = None,
+    per_position: bool = False,
 ) -> list[dict]:
+    """
+    Score a group of sequences and write the result files.
+
+    per_position controls the two heavyweight outputs (the full scores JSON
+    and the long-format per-position CSV). They scale as sequences x columns
+    and for a few thousand designs run to hundreds of megabytes, past what
+    git will accept, so they are opt-in. The summary CSV is always written
+    and is what you rank on.
+    """
     group_slug = group.lower().strip().replace(" ", "_")
     all_results = []
 
     for header, seq in records:
-        scores = score_designed_sequence(seq, profile)
+        scores = score_designed_sequence(seq, profile, cols)
         agg    = aggregate_scores(scores)
         all_results.append({
             "header":       header,
@@ -314,11 +462,12 @@ def score_sequence_group(
             "per_position": scores,
         })
 
-    # per-sequence JSON
-    json_path = f"{prefix}_{group_slug}_scores.json"
-    with open(json_path, "w") as f:
-        json.dump(all_results, f, indent=2)
-    print(f"  ✓ {group.title()} scores (JSON)            → {json_path}")
+    # per-sequence JSON  (opt-in: large)
+    if per_position:
+        json_path = f"{prefix}_{group_slug}_scores.json"
+        with open(json_path, "w") as f:
+            json.dump(all_results, f, indent=2)
+        print(f"  ✓ {group.title()} scores (JSON)            → {json_path}")
 
     # per-sequence summary CSV
     if all_results:
@@ -330,48 +479,199 @@ def score_sequence_group(
             w.writerows(summary_rows)
         print(f"  ✓ {group.title()} summary CSV              → {sum_csv}")
 
-    # long-format per-position CSV
-    pos_csv = f"{prefix}_{group_slug}_per_position.csv"
-    with open(pos_csv, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "sequence", "col", "position", "aa",
-            "H_bits", "gap_frac_natural",
-            "penalty_A_entropy_lookup",
-            "penalty_B_distribution_dev",
-            "combined_penalty",
-            "p_aa_in_natural",
-        ])
-        for res in all_results:
-            for s in res["per_position"]:
-                w.writerow([
-                    res["header"],
-                    s["col"], s["position"], s["aa"],
-                    s["H_bits"], s["gap_frac_natural"],
-                    s["penalty_A_entropy_lookup"],
-                    s["penalty_B_distribution_dev"],
-                    s["combined_penalty"],
-                    s["p_aa_in_natural"],
-                ])
-    print(f"  ✓ {group.title()} per-position CSV         → {pos_csv}")
+    # long-format per-position CSV  (opt-in: large)
+    if per_position:
+        pos_csv = f"{prefix}_{group_slug}_per_position.csv"
+        with open(pos_csv, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "sequence", "col", "position", "aa",
+                "H_bits", "gap_frac_natural",
+                "penalty_A_entropy_lookup",
+                "penalty_B_distribution_dev",
+                "penalty_weighted",
+                "combined_penalty",
+                "p_aa_in_natural",
+            ])
+            for res in all_results:
+                for s in res["per_position"]:
+                    w.writerow([
+                        res["header"],
+                        s["col"], s["position"], s["aa"],
+                        s["H_bits"], s["gap_frac_natural"],
+                        s["penalty_A_entropy_lookup"],
+                        s["penalty_B_distribution_dev"],
+                        s["penalty_weighted"],
+                        s["combined_penalty"],
+                        s["p_aa_in_natural"],
+                    ])
+        print(f"  ✓ {group.title()} per-position CSV         → {pos_csv}")
 
     return all_results
 
 
 def score_all_designed(
-    records: list[tuple[str, str]],
-    profile: list[dict],
-    prefix:  str,
+    records:      list[tuple[str, str]],
+    profile:      list[dict],
+    prefix:       str,
+    cols:         list[int] | None = None,
+    per_position: bool = False,
 ) -> list[dict]:
-    return score_sequence_group(records, profile, prefix, "designed")
+    return score_sequence_group(
+        records, profile, prefix, "designed", cols, per_position
+    )
 
 
 def score_all_natural(
+    records:      list[tuple[str, str]],
+    profile:      list[dict],
+    prefix:       str,
+    cols:         list[int] | None = None,
+    per_position: bool = False,
+) -> list[dict]:
+    return score_sequence_group(
+        records, profile, prefix, "natural", cols, per_position
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Calibration — turning a penalty into a percentile
+# ══════════════════════════════════════════════════════════════════════════
+
+def leave_one_out_calibration(
+    records:      list[tuple[str, str]],
+    cols:         list[int],
+    max_gap_frac: float = 1.0,
+    metric:       str = "mean_penalty_weighted",
+) -> dict:
+    """
+    Score each natural sequence against a profile built from the others.
+
+    Scoring the natural set against a profile built from all of it — which
+    is what the original pipeline did — leaks: every sequence contributed
+    to the distribution it is then measured against, so the scores come out
+    flatteringly low and cannot serve as a reference. Holding each sequence
+    out removes the leak and yields an honest reference distribution: the
+    scores real members of this family earn.
+
+    Column selection is kept fixed across the folds (from the full-set
+    profile) so that every fold is scored on the same columns. Dropping one
+    of 22 sequences does shift each column's gap fraction slightly, which
+    would otherwise move the column set from fold to fold.
+    """
+    n = len(records)
+    if n < 3:
+        raise ValueError("Leave-one-out calibration needs at least 3 sequences.")
+
+    folds = []
+    for i, (header, seq) in enumerate(records):
+        rest    = records[:i] + records[i + 1:]
+        prof    = compute_natural_profile(rest, max_gap_frac=max_gap_frac)
+        scores  = score_designed_sequence(seq, prof, cols)
+        agg     = aggregate_scores(scores)
+        folds.append({"header": header, **agg})
+
+    vals = sorted(f[metric] for f in folds if metric in f)
+    mean = sum(vals) / len(vals)
+    var  = sum((v - mean) ** 2 for v in vals) / len(vals)
+    return {
+        "metric":       metric,
+        "n_folds":      n,
+        "scoring_cols": len(cols),
+        "mean":         round(mean, 6),
+        "sd":           round(var ** 0.5, 6),
+        "min":          round(vals[0], 6),
+        "max":          round(vals[-1], 6),
+        "values":       [round(v, 6) for v in vals],
+        "folds":        folds,
+    }
+
+
+def apply_calibration(
+    all_results: list[dict],
+    calib:       dict,
+    metric:      str = "mean_penalty_weighted",
+) -> None:
+    """
+    Annotate each scored sequence with its standing against the reference
+    distribution, in place.
+
+    percentile_vs_natural is the share of natural folds scoring BELOW this
+    sequence, so 0 is better than every natural homolog and 100 is worse
+    than all of them. With ~20 folds the resolution is about 5 points —
+    read it as a band, not a number, and treat z_vs_natural as the finer
+    ordering. worse_than_worst_natural is the blunt instrument: a design
+    that trips it places a residue combination no real family member does.
+    """
+    ref = calib["values"]
+    sd  = calib["sd"] or 1e-12
+    mu  = calib["mean"]
+    worst = calib["max"]
+
+    for res in all_results:
+        agg = res.get("aggregate") or {}
+        val = agg.get(metric)
+        if val is None:
+            continue
+        below = sum(1 for r in ref if r < val)
+        agg["percentile_vs_natural"]    = round(100.0 * below / len(ref), 1)
+        agg["z_vs_natural"]             = round((val - mu) / sd, 3)
+        agg["worse_than_worst_natural"] = bool(val > worst)
+
+
+def shuffle_null(
     records: list[tuple[str, str]],
     profile: list[dict],
-    prefix:  str,
-) -> list[dict]:
-    return score_sequence_group(records, profile, prefix, "natural")
+    cols:    list[int],
+    n_per:   int = 1,
+    seed:    int = 0,
+    metric:  str = "mean_penalty_weighted",
+) -> dict:
+    """
+    Sanity control: permute each sequence's own residues among the scored
+    columns and rescore.
+
+    A shuffle preserves composition exactly and destroys only the pairing of
+    residue to position, so it isolates whether the score responds to WHERE
+    residues sit. If designs do not separate cleanly from their own shuffles,
+    the metric is not measuring position-specific fit and nothing downstream
+    of it means anything.
+    """
+    import random
+    rng  = random.Random(seed)
+    vals = []
+    for _, seq in records:
+        chars = [seq[c] for c in cols if c < len(seq)]
+        for _ in range(n_per):
+            shuffled = chars[:]
+            rng.shuffle(shuffled)
+            fake = dict(zip(cols, shuffled))
+            scores = []
+            for c in cols:
+                if c not in fake:
+                    continue
+                aa = fake[c]
+                if aa in GAP_CHARS:
+                    continue
+                prof   = profile[c]
+                norm_H = prof["norm_H"]
+                p_aa   = max(prof["blosum_dist"].get(aa.upper(), 1e-8), 1e-8)
+                b      = -math.log2(p_aa) / MAX_ENTROPY
+                scores.append((1.0 - norm_H) * b)
+            if scores:
+                vals.append(sum(scores) / len(scores))
+
+    vals.sort()
+    mean = sum(vals) / len(vals)
+    var  = sum((v - mean) ** 2 for v in vals) / len(vals)
+    return {
+        "metric": metric,
+        "n":      len(vals),
+        "mean":   round(mean, 6),
+        "sd":     round(var ** 0.5, 6),
+        "min":    round(vals[0], 6),
+        "max":    round(vals[-1], 6),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -599,13 +899,68 @@ def print_split_report(natural, designed, prefix):
 # CLI commands
 # ══════════════════════════════════════════════════════════════════════════
 
+def _report_calibration(calib: dict, shuf: dict | None = None):
+    print("\n  ───────────────────────────────────────────────────────")
+    print("  Leave-one-out reference distribution")
+    print("  ───────────────────────────────────────────────────────")
+    print(f"  Metric              : {calib['metric']}")
+    print(f"  Folds (held out)    : {calib['n_folds']}")
+    print(f"  Scoring columns     : {calib['scoring_cols']}")
+    print(f"  Natural mean ± sd   : {calib['mean']:.4f} ± {calib['sd']:.4f}")
+    print(f"  Natural range       : {calib['min']:.4f} – {calib['max']:.4f}")
+    if shuf:
+        sep = (shuf["mean"] - calib["mean"]) / (calib["sd"] or 1e-12)
+        print(f"  Shuffle-null mean   : {shuf['mean']:.4f} ± {shuf['sd']:.4f}")
+        print(f"  Separation          : {sep:+.1f} natural sd")
+        if sep < 1.0:
+            print("  !! Shuffles score about as well as the real sequences.")
+            print("     The metric is not responding to residue placement —")
+            print("     fix that before trusting any ranking below.")
+    print("  ───────────────────────────────────────────────────────")
+
+
+def _resolve_cols_for_designs(profile, designed, args):
+    """Work out which columns to score, honouring --positions."""
+    spec = getattr(args, "positions", None)
+    if spec is not None and spec.strip().lower() == "auto":
+        varied = detect_variable_columns(designed)
+        print(f"\n  --positions auto: {len(varied)} of {len(profile)} columns "
+              f"differ between designs")
+        if not varied:
+            print("    none vary — falling back to every column")
+            positions = None
+        else:
+            positions = varied
+    else:
+        positions = parse_positions(spec, len(profile))
+    return resolve_scoring_columns(profile, positions)
+
+
 def cmd_natural(args):
     print(f"\n[Stage 1] Natural sequences: {args.fasta}")
     records = read_fasta(args.fasta)
     print(f"  Loaded {len(records)} sequences  |  alignment length {len(records[0][1])}")
-    profile = compute_natural_profile(records)
+    profile = compute_natural_profile(records, max_gap_frac=args.max_gap_frac)
+    n_drop = sum(1 for c in profile if not c["scorable"])
+    if n_drop:
+        print(f"  Columns above --max-gap-frac {args.max_gap_frac}: "
+              f"{n_drop} marked unscorable")
     print_natural_summary(profile, len(records))
     save_natural_profile(profile, args.out)
+
+    if args.loo:
+        positions = parse_positions(getattr(args, "positions", None), len(profile))
+        cols  = resolve_scoring_columns(profile, positions)
+        calib = leave_one_out_calibration(
+            records, cols, max_gap_frac=args.max_gap_frac
+        )
+        shuf  = shuffle_null(records, profile, cols, n_per=20)
+        _report_calibration(calib, shuf)
+        path = f"{args.out}_calibration.json"
+        with open(path, "w") as f:
+            json.dump({"leave_one_out": calib, "shuffle_null": shuf}, f, indent=2)
+        print(f"  ✓ Calibration → {path}")
+
     if args.plot:
         plot_natural_profile(profile, args.out)
 
@@ -623,10 +978,57 @@ def cmd_designed(args):
     natural, designed = split_combined(all_records, args.design_prefix)
     print_split_report(natural, designed, args.design_prefix)
 
-    all_results = score_all_designed(designed, profile, args.out)
-    natural_results = score_all_natural(natural, profile, args.out)
+    cols = _resolve_cols_for_designs(profile, designed, args)
+
+    all_results = score_all_designed(
+        designed, profile, args.out, cols, args.per_position
+    )
+    natural_results = score_all_natural(
+        natural, profile, args.out, cols, args.per_position
+    )
     print_designed_summary(all_results)
     print_natural_penalty_summary(natural_results)
+
+    if args.calibration:
+        with open(args.calibration) as f:
+            blob = json.load(f)
+        calib = blob.get("leave_one_out", blob)
+
+        # A percentile only means something if the reference distribution was
+        # built on the same columns the designs were scored on. In the
+        # two-step workflow it is easy to calibrate over the whole alignment
+        # and then score designs on a subset, which silently compares two
+        # different quantities.
+        calib_cols = calib.get("scoring_cols")
+        if calib_cols is not None and calib_cols != len(cols):
+            print(f"\n  !! Calibration was built on {calib_cols} columns but these")
+            print(f"     designs were scored on {len(cols)}. Percentiles and")
+            print( "     z-scores would compare different quantities, so they are")
+            print( "     being skipped. Re-run 'natural --loo' with the same")
+            print( "     --positions, or use the 'both --loo' subcommand, which")
+            print( "     keeps the two consistent by construction.")
+            args.calibration = None
+
+    if args.calibration:
+        apply_calibration(all_results, calib)
+        apply_calibration(natural_results, calib)
+        _report_calibration(calib, blob.get("shuffle_null"))
+        flagged = sum(
+            1 for r in all_results
+            if r["aggregate"].get("worse_than_worst_natural")
+        )
+        print(f"\n  Designs worse than every natural homolog: "
+              f"{flagged} / {len(all_results)}")
+        # rewrite the summary CSV so the calibrated fields land in it
+        rows = [{"sequence": r["header"], **r["aggregate"]} for r in all_results]
+        if rows:
+            sum_csv = f"{args.out}_designed_summary.csv"
+            with open(sum_csv, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                w.writeheader()
+                w.writerows(rows)
+            print(f"  ✓ Calibrated summary → {sum_csv}")
+
     if args.plot:
         plot_designed_scores(all_results, profile, args.out)
 
@@ -636,7 +1038,11 @@ def cmd_both(args):
     print(f"\n[Stage 1] Natural sequences: {args.natural}")
     nat_records = read_fasta(args.natural)
     print(f"  Loaded {len(nat_records)} sequences  |  alignment length {len(nat_records[0][1])}")
-    profile = compute_natural_profile(nat_records)
+    profile = compute_natural_profile(nat_records, max_gap_frac=args.max_gap_frac)
+    n_drop = sum(1 for c in profile if not c["scorable"])
+    if n_drop:
+        print(f"  Columns above --max-gap-frac {args.max_gap_frac}: "
+              f"{n_drop} marked unscorable")
     print_natural_summary(profile, len(nat_records))
     save_natural_profile(profile, args.out)
     if args.plot:
@@ -650,10 +1056,44 @@ def cmd_both(args):
     natural, designed = split_combined(all_records, args.design_prefix)
     print_split_report(natural, designed, args.design_prefix)
 
-    all_results = score_all_designed(designed, profile, args.out)
-    natural_results = score_all_natural(natural, profile, args.out)
+    cols = _resolve_cols_for_designs(profile, designed, args)
+
+    all_results = score_all_designed(
+        designed, profile, args.out, cols, args.per_position
+    )
+    natural_results = score_all_natural(
+        natural, profile, args.out, cols, args.per_position
+    )
     print_designed_summary(all_results)
     print_natural_penalty_summary(natural_results)
+
+    if args.loo:
+        calib = leave_one_out_calibration(
+            nat_records, cols, max_gap_frac=args.max_gap_frac
+        )
+        shuf = shuffle_null(nat_records, profile, cols, n_per=20)
+        apply_calibration(all_results, calib)
+        apply_calibration(natural_results, calib)
+        _report_calibration(calib, shuf)
+        flagged = sum(
+            1 for r in all_results
+            if r["aggregate"].get("worse_than_worst_natural")
+        )
+        print(f"\n  Designs worse than every natural homolog: "
+              f"{flagged} / {len(all_results)}")
+        path = f"{args.out}_calibration.json"
+        with open(path, "w") as f:
+            json.dump({"leave_one_out": calib, "shuffle_null": shuf}, f, indent=2)
+        print(f"  ✓ Calibration → {path}")
+        rows = [{"sequence": r["header"], **r["aggregate"]} for r in all_results]
+        if rows:
+            sum_csv = f"{args.out}_designed_summary.csv"
+            with open(sum_csv, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                w.writeheader()
+                w.writerows(rows)
+            print(f"  ✓ Calibrated summary → {sum_csv}")
+
     if args.plot:
         plot_designed_scores(all_results, profile, args.out)
 
@@ -678,6 +1118,23 @@ def main():
         help="Output file prefix  (default: natural)")
     p1.add_argument("--plot",  action="store_true",
         help="Save profile plots as PNG")
+    p1.add_argument("--max-gap-frac", type=float, default=0.3,
+        help="Mark columns with a natural gap fraction above this as\n"
+             "unscorable. A column where most homologs are absent has its\n"
+             "distribution estimated from a few residues and produces\n"
+             "unreliable extremes.  (default: 0.3)")
+    p1.add_argument("--positions", default=None,
+        help="Alignment columns to score:\n"
+             "  auto          only columns that differ between designs\n"
+             "                (the designable positions)\n"
+             "  all           every column  (default)\n"
+             "  80,94-99      explicit 1-based alignment positions\n"
+             "  cols.txt      file, one position per line\n"
+             "These are alignment columns, not PDB residue numbers.")
+    p1.add_argument("--loo", action="store_true",
+        help="Leave-one-out calibration: score each natural sequence against\n"
+             "a profile built from the others, plus a shuffle control.\n"
+             "Writes <out>_calibration.json for use with 'designed'.")
 
     # ── designed ──
     p2 = sub.add_parser("designed",
@@ -697,6 +1154,21 @@ def main():
         help="Output file prefix  (default: results)")
     p2.add_argument("--plot",           action="store_true",
         help="Save score plots as PNG")
+    p2.add_argument("--positions", default=None,
+        help="Alignment columns to score:\n"
+             "  auto          only columns that differ between designs\n"
+             "                (the designable positions)\n"
+             "  all           every column  (default)\n"
+             "  80,94-99      explicit 1-based alignment positions\n"
+             "  cols.txt      file, one position per line\n"
+             "These are alignment columns, not PDB residue numbers.")
+    p2.add_argument("--calibration", default=None,
+        help="Calibration JSON from 'natural --loo'. Adds percentile,\n"
+             "z-score and worse-than-worst-natural flags to the summary.")
+    p2.add_argument("--per-position", action="store_true",
+        help="Also write the full per-residue scores JSON and long-format\n"
+             "CSV. These scale as sequences x columns and reach hundreds of\n"
+             "megabytes for a few thousand designs, so they are off by default.")
 
     # ── both ──
     p3 = sub.add_parser("both",
@@ -711,6 +1183,24 @@ def main():
         help="Output file prefix  (default: results)")
     p3.add_argument("--plot",           action="store_true",
         help="Save all plots as PNG")
+    p3.add_argument("--max-gap-frac", type=float, default=0.3,
+        help="Mark columns with a natural gap fraction above this as\n"
+             "unscorable. A column where most homologs are absent has its\n"
+             "distribution estimated from a few residues and produces\n"
+             "unreliable extremes.  (default: 0.3)")
+    p3.add_argument("--positions", default=None,
+        help="Alignment columns to score:\n"
+             "  auto          only columns that differ between designs\n"
+             "                (the designable positions)\n"
+             "  all           every column  (default)\n"
+             "  80,94-99      explicit 1-based alignment positions\n"
+             "  cols.txt      file, one position per line\n"
+             "These are alignment columns, not PDB residue numbers.")
+    p3.add_argument("--loo", action="store_true",
+        help="Leave-one-out calibration of the natural set, and annotate\n"
+             "every design with its standing against that distribution.")
+    p3.add_argument("--per-position", action="store_true",
+        help="Also write the large per-residue JSON and CSV outputs.")
 
     args = parser.parse_args()
     {"natural": cmd_natural, "designed": cmd_designed, "both": cmd_both}[args.cmd](args)
