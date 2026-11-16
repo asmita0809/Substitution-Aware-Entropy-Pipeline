@@ -273,8 +273,8 @@ anything, because it is hard to retrofit.
 ## Install
 
 ```bash
-git clone <your-repo-url>
-cd entropy-pipeline
+git clone https://github.com/asmita0809/Substitution-Aware-Entropy-Pipeline.git
+cd Substitution-Aware-Entropy-Pipeline
 ```
 
 The core pipeline runs on the **Python standard library alone** (3.9+) — no
