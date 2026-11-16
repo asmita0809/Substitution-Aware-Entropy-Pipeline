@@ -3,7 +3,7 @@
 Scores designed protein sequences against the evolutionary tolerance of their
 natural homologs, using BLOSUM62-weighted per-position Shannon entropy.
 
-Built for a cutinase design campaign — cutinase (PDB **1CEX**, *Fusarium solani*)
+Built for a cutinase design campaign — cutinase from *Fusarium solani*
 is an ester hydrolase of interest for polyester/PET degradation — but the
 pipeline is sequence-family agnostic. Point it at any MAFFT alignment.
 
