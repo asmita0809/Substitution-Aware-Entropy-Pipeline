@@ -3,9 +3,9 @@
 Scores designed protein sequences against the evolutionary tolerance of their
 natural homologs, using BLOSUM62-weighted per-position Shannon entropy.
 
-Built for a cutinase design campaign — cutinase from *Fusarium solani*
-is an ester hydrolase of interest for polyester/PET degradation — but the
-pipeline is sequence-family agnostic. Point it at any MAFFT alignment.
+Built for a cutinase design campaign (cutinase from *Fusarium solani* is an
+ester hydrolase of interest for polyester/PET degradation), but the pipeline is
+sequence-family agnostic. Point it at any MAFFT alignment.
 
 ## The idea
 
@@ -15,7 +15,7 @@ for millions of years. This tool asks a narrower, cheaper question than a
 folding or stability calculation:
 
 > At each position, how much variation does the natural family actually
-> tolerate — and does this designed sequence respect that?
+> tolerate, and does this designed sequence respect that?
 
 Positions where natural homologs are invariant are positions where a
 substitution is likely to be costly. Positions that drift freely across the
@@ -25,8 +25,8 @@ family are positions where a design can be bold for free.
 
 Plain per-column frequency counting treats every substitution as equally
 foreign. With 22 natural sequences, a column containing only `I` scores a
-designed `V` exactly as harshly as a designed `D` — though I→V is a
-conservative aliphatic swap and I→D is not.
+designed `V` exactly as harshly as a designed `D`, though I→V is a conservative
+aliphatic swap and I→D is not.
 
 So each observed residue is first spread over all 20 amino acids via a softmax
 over its BLOSUM62 row, and the column distribution is the mean of those spread
@@ -46,16 +46,16 @@ every step of the reasoning, use this one.
 **PROSS** (Goldenzweig et al., *Mol Cell* 2016; PROSS 2 server, Weinstein et
 al., *Bioinformatics* 2021) builds a PSSM from homologs and combines it with
 Rosetta all-atom energies; the current server accepts an uploaded MSA directly.
-Its community evaluation is unusually thorough — twelve independent
-laboratories ran it on 14 unrelated targets without developer support, and nine
-of ten tested targets gained thermal stability (Peleg et al., *JMB* 2021).
+Its community evaluation is unusually thorough: twelve independent laboratories
+ran it on 14 unrelated targets without developer support, and nine of ten
+tested targets gained thermal stability (Peleg et al., *JMB* 2021).
 
 **FuncLib** (Khersonsky et al., *Mol Cell* 2018) is the closest relative to
 `make-resfile`. It constrains sequence space position by position using
 conservation (PSSM) together with ΔΔG mutational scanning, producing a
 per-position list of tolerated residues, then enumerates combinations with
 Rosetta. That per-position tolerated alphabet is the same object `make-resfile`
-emits — the difference is that FuncLib adds a structural energy term and this
+emits. The difference is that FuncLib adds a structural energy term and this
 does not.
 
 **htFuncLib** (Weinstein et al., *Nat Commun* 2023) extends that with machine
@@ -64,7 +64,7 @@ interactions, recovering thousands of functional GFP variants. That directly
 addresses the per-column independence listed under Known Limitations below.
 
 Using entropy specifically, rather than a PSSM cutoff, also has its own
-lineage — Chan et al. (2004), Bae et al. (2008) and Borgo & Havranek (2012),
+lineage: Chan et al. (2004), Bae et al. (2008) and Borgo & Havranek (2012),
 cited at the end.
 
 And for *ranking* designs, learned models have overtaken profile methods
@@ -89,8 +89,7 @@ Nothing algorithmic. What it does offer:
 - **Numbering checked rather than assumed**, with the offset verified against
   a named template sequence inside the alignment.
 
-If you use this in published work, cite the methods above — not this
-repository.
+If you use this in published work, cite the methods above, not this repository.
 
 ## Scoring
 
@@ -98,17 +97,17 @@ Each scored residue gets three numbers:
 
 | Metric | Definition | Range | Use |
 |---|---|---|---|
-| **A — column entropy** | `norm_H` at that column | [0, 1] | diagnostic only |
-| **B — distribution deviation** | `−log2 P(aa \| BLOSUM dist) / log2(20)` | [0, ~6.1] | component |
-| **Weighted** | `(1 − norm_H) · B` | — | **rank on this** |
-| *Combined (legacy)* | `mean(A, B)` | — | comparability with old runs |
+| **A: column entropy** | `norm_H` at that column | [0, 1] | diagnostic only |
+| **B: distribution deviation** | `-log2 P(aa \| BLOSUM dist) / log2(20)` | [0, ~6.1] | component |
+| **Weighted** | `(1 - norm_H) · B` | n/a | **rank on this** |
+| *Combined (legacy)* | `mean(A, B)` | n/a | comparability with old runs |
 
 **Metric A cannot rank designs, and the legacy combined score inherits that.**
 A is a property of the *column*, not of the residue placed in it. Across a
 design set that shares one gap pattern, every sequence averages A over the same
 columns and receives the same constant. On the 5,150-design run behind this
 repo, metric A was identical to six decimal places for every design, and
-`mean(A, B)` therefore spanned only 4.2% of its own mean — noise.
+`mean(A, B)` therefore spanned only 4.2% of its own mean, which is noise.
 
 The weighted penalty expresses what A was reaching for: the same substitution
 costs more at a conserved column than at a variable one. Multiplying encodes
@@ -126,14 +125,14 @@ sequences carry a gap as unscorable. Such a column's distribution rests on a
 handful of residues and will cheerfully emit the largest penalties in a run out
 of pure sampling noise. In the original cutinase run the three worst-scoring
 variable positions were columns that are 73%, 55% and 82% gaps in the natural
-set — estimated from 6, 10 and 4 sequences respectively.
+set, estimated from 6, 10 and 4 sequences respectively.
 
 **`--positions auto`** restricts scoring to the columns that actually differ
 between your designs. Everything else holds the same residue in every sequence
 and contributes an identical constant to each per-sequence mean, padding the
 average and compressing the spread. In the cutinase run, 235 of 276 columns
-were identical across all 5,150 designs — 41 varied, of which 38 survived the
-gap filter.
+were identical across all 5,150 designs. Only 41 varied, of which 38 survived
+the gap filter.
 
 Both filters together, on real data:
 
@@ -147,7 +146,7 @@ legacy top 100 designs remain in the new top 100**. The reordering is real, not
 cosmetic.
 
 `--positions` also takes explicit alignment positions (`80,82,94-99`), a file
-with one per line, or **a Rosetta resfile** — the last of these needs
+with one per line, or **a Rosetta resfile**. The last of these needs
 `--template` so the residue numbers can be mapped onto columns (see below).
 Bare numbers are alignment columns, not residue numbers.
 
@@ -158,17 +157,18 @@ distribution from sequences already known to be real members of the family.
 
 For each natural sequence, a profile is built from **the other** sequences and
 the held-out one is scored against it. Scoring the natural set against a
-profile built from all of it — what this pipeline originally did — leaks: every
-sequence contributed to the distribution it is then measured against, so the
-scores come out flatteringly low and cannot serve as a reference.
+profile built from all of it, which is what this pipeline originally did,
+leaks: every sequence contributed to the distribution it is then measured
+against, so the scores come out flatteringly low and cannot serve as a
+reference.
 
 Each design then gets:
 
-- `percentile_vs_natural` — share of natural folds scoring below it. 0 beats
+- `percentile_vs_natural`: share of natural folds scoring below it. 0 beats
   every homolog; 100 is worse than all of them. With ~20 folds the resolution
   is about 5 points, so read it as a band.
-- `z_vs_natural` — finer ordering, in natural standard deviations.
-- `worse_than_worst_natural` — the blunt flag: this design places a residue
+- `z_vs_natural`: finer ordering, in natural standard deviations.
+- `worse_than_worst_natural`: the blunt flag. This design places a residue
   combination no real family member does.
 
 `--loo` also runs a **shuffle control**: each sequence's own residues are
@@ -184,7 +184,7 @@ mean **0.169 ± 0.035** against a shuffle-null mean of **1.123**, a separation o
 
 A percentile is only meaningful if the reference was built on the same columns
 the designs were scored on. Pass matching `--positions` to both stages, or use
-`both --loo`, which keeps them consistent by construction — a mismatch is
+`both --loo`, which keeps them consistent by construction. A mismatch is
 detected and the annotation skipped rather than silently reported.
 
 ## Generating a design space
@@ -215,7 +215,8 @@ Two decisions, taken from two different parts of the profile:
 
 Cysteines are held fixed by default (`--no-lock-cys` to override), since
 mutating one half of a disulfide is rarely intended, and `--lock` pins
-mechanistically essential residues — a catalytic triad — regardless of entropy.
+mechanistically essential residues such as a catalytic triad, regardless of
+entropy.
 
 Output is the resfile plus `*_rationale.csv`, one row per template residue
 recording the mode, the alphabet, the entropy and *why* that decision was made.
@@ -224,13 +225,13 @@ recording the mode, the alphabet, the entropy and *why* that decision was made.
 
 A wrong offset fails silently: Rosetta constrains the wrong residue at every
 position and reports nothing. So the map is always built from a named sequence
-inside the alignment, never assumed — `--template` takes a header substring and
+inside the alignment, never assumed. `--template` takes a header substring and
 `--template-start` the residue number of its first non-gap residue.
 
 The cutinase case shows why this needs care. The template is in the alignment as
 `sp|P00590|CUTI1_FUSVN`, the 230-residue precursor, and matches the 1CEX
-deposited sequence at **99.5% identity with a +16 offset** — 1CEX begins at
-precursor residue 17, after the signal peptide. So a residue number quoted in
+deposited sequence at **99.5% identity with a +16 offset**, because 1CEX begins
+at precursor residue 17, after the signal peptide. So a residue number quoted in
 one convention is 16 off in the other, and a catalytic position quoted from a
 paper in mature numbering is off by about 31. Confirm `--template-start`
 against the ATOM records of the PDB you will actually pass Rosetta; an RCSB
@@ -249,20 +250,20 @@ FASTA gives SEQRES order, which need not match author numbering.
 | mean alphabet size | manual 2.1, generated 4.3 |
 
 Every reference position mapped, which is the check that the numbering is
-right — a bad offset leaves orphans. The generator is roughly twice as
+right, since a bad offset leaves orphans. The generator is roughly twice as
 permissive as the manual file at `--top-p 0.90`; lower it to tighten.
 
 The comparison also flags a resfile whose header has a **commented-out default
 command** (`#NATRO`). That leaves unlisted residues falling through to Rosetta's
-own default, where they are designable to any amino acid — usually the opposite
+own default, where they are designable to any amino acid, usually the opposite
 of what was meant.
 
 ### The circularity trap
 
 If you generate a resfile from profile P and then score the resulting designs
-with profile P, **the designs score well by construction** — you constrained
-them to. The scoring stage stops being a validation and becomes a tautology
-that looks like success.
+with profile P, **the designs score well by construction**, because you
+constrained them to. The scoring stage stops being a validation and becomes a
+tautology that looks like success.
 
 Constraint and evaluation have to draw on different information. Either split
 the homologs into disjoint sets, building the resfile from one and calibrating
@@ -277,7 +278,7 @@ git clone https://github.com/asmita0809/Substitution-Aware-Entropy-Pipeline.git
 cd Substitution-Aware-Entropy-Pipeline
 ```
 
-The core pipeline runs on the **Python standard library alone** (3.9+) — no
+The core pipeline runs on the **Python standard library alone** (3.9+), with no
 install step. `matplotlib` and `numpy` are imported lazily, only when you pass
 `--plot`:
 
@@ -286,7 +287,7 @@ pip install -r requirements.txt   # only for figures / the notebook
 ```
 
 [MAFFT](https://mafft.cbrc.jp/alignment/software/) is required to produce the
-alignments but is not called by this script — you align first, then feed the
+alignments but is not called by this script. You align first, then feed the
 result in.
 
 ## Quickstart
@@ -307,15 +308,15 @@ by exactly this command.
 ## Full workflow
 
 ```bash
-# 1 — align the natural homologs
+# 1. align the natural homologs
 mafft --auto natural.fasta > natural_aligned.fasta
 
-# 2 — add designed sequences into that alignment
-#     (--add keeps the natural columns fixed, which is what makes
-#      column indices comparable between the two stages)
+# 2. add designed sequences into that alignment
+#    (--add keeps the natural columns fixed, which is what makes
+#     column indices comparable between the two stages)
 mafft --add designed.fasta --reorder natural_aligned.fasta > combined.fasta
 
-# 3 — both stages, calibrated, scoring only the designable columns
+# 3. both stages, calibrated, scoring only the designable columns
 python entropy_pipeline.py both \
     --natural natural_aligned.fasta \
     --combined combined.fasta \
@@ -328,8 +329,8 @@ Then rank on `mean_penalty_weighted` in `results_designed_summary.csv`, and read
 `percentile_vs_natural` to see where each design sits against real homologs.
 
 `--design-prefix` is matched case-insensitively against the full FASTA header.
-Check the split report before trusting anything — a prefix matching nothing
-silently yields zero designs.
+Check the split report before trusting anything, since a prefix matching
+nothing silently yields zero designs.
 
 ## Outputs
 
@@ -341,8 +342,8 @@ silently yields zero designs.
 | `*_calibration.json` | Leave-one-out distribution, per-fold scores, shuffle null |
 | `*.resfile` | Rosetta design specification (`make-resfile`) |
 | `*_rationale.csv` | Per-residue mode, alphabet, entropy and reason |
-| `*_scores.json` | Full per-residue scores — **`--per-position` only** |
-| `*_per_position.csv` | Long-format per-residue table — **`--per-position` only** |
+| `*_scores.json` | Full per-residue scores, **`--per-position` only** |
+| `*_per_position.csv` | Long-format per-residue table, **`--per-position` only** |
 
 The last two scale as sequences × columns. The original 5,150-design run wrote a
 **319 MB JSON** and an **87 MB CSV**, past what GitHub accepts, so they are now
@@ -351,9 +352,9 @@ opt-in. The summary CSV is always written and is what you rank on.
 ## Notebook
 
 `entropy_pipeline.ipynb` is a cell-by-cell version of the same code, plus a
-`logomaker` sequence-logo stage the CLI lacks. Outputs are cleared — run top to
-bottom. The config cell near the top sets input filenames and design prefix in
-one place. Note that the notebook predates the weighted metric and the column
+`logomaker` sequence-logo stage the CLI lacks. Outputs are cleared, so run top
+to bottom. The config cell near the top sets input filenames and design prefix
+in one place. Note that the notebook predates the weighted metric and the column
 filters; the CLI is the current implementation.
 
 ## Repository layout
@@ -362,7 +363,7 @@ filters; the CLI is the current implementation.
 entropy_pipeline.py        # CLI: natural / designed / both
 entropy_pipeline.ipynb     # notebook twin + sequence logos
 data/
-  natural_cutinase_msa_22.fasta   # aligned, 22 homologs — demo input
+  natural_cutinase_msa_22.fasta   # aligned, 22 homologs, demo input
   natural_cutinase_23.fasta       # 23-sequence set
   fusarium_msa_27.fasta           # 27-sequence Fusarium alignment
   1cex_reference.fasta            # PDB 1CEX reference sequence
@@ -374,22 +375,22 @@ examples/
 ## Known limitations
 
 - **The natural set is small.** 22 sequences cluster into 13 groups at 80%
-  identity and 9 at 62%, and one pair is 99.6% identical — so roughly 13
+  identity and 9 at 62%, and one pair is 99.6% identical, so roughly 13
   effective observations per column for estimating a 20-way distribution.
   Conservation may reflect shared Fusarium ancestry rather than functional
   constraint. Deepening the alignment (jackhmmer or HHblits against UniRef) is
   the single largest available improvement.
 - **No sequence weighting.** That near-duplicate pair votes twice. Henikoff
   position-based weighting would fix it.
-- **The softmax is unscaled.** `exp()` over raw BLOSUM scores is very sharp —
-  `exp(11)` against `exp(−4)` is a ratio of three million. Standard
+- **The softmax is unscaled.** `exp()` over raw BLOSUM scores is very sharp:
+  `exp(11)` against `exp(-4)` is a ratio of three million. Standard
   target-frequency pseudocounts (observed counts mixed against BLOSUM62 target
   frequencies, weighted by `N_eff`) would be better behaved and comparable to
   the PSSM literature.
-- **Per-column independence.** Coupled positions — salt bridges, packing pairs,
-  a catalytic triad acting together — are invisible. A design can score well
-  here and still be broken. Mutual information or a DCA model would address it,
-  but both need far more effective sequences than 13.
+- **Per-column independence.** Coupled positions such as salt bridges, packing
+  pairs or a catalytic triad acting together are invisible. A design can score
+  well here and still be broken. Mutual information or a DCA model would
+  address it, but both need far more effective sequences than 13.
 - **No structural term.** Burial, secondary structure and solvent accessibility
   all modulate substitution cost, and none are used.
 - **Gaps are skipped, not modeled.** Indel-heavy designs are scored on fewer
@@ -399,7 +400,7 @@ examples/
 ## Status
 
 Exploratory research code from a working design campaign, cleaned up and made
-reproducible. It is not a validated predictor — treat the scores as a triage
+reproducible. It is not a validated predictor, so treat the scores as a triage
 filter for prioritizing candidates, not as a prediction of stability or
 activity. Nothing here has been checked against measured data, and the method
 it implements is established elsewhere (see Relation to existing methods).
@@ -415,22 +416,22 @@ term buys.
 ### Methods this reimplements
 
 - Goldenzweig A, *et al.* Automated structure- and sequence-based design of
-  proteins for high bacterial expression and stability. *Mol Cell* 63, 1–10
-  (2016). doi:10.1016/j.molcel.2016.06.012 — **PROSS**
+  proteins for high bacterial expression and stability. *Mol Cell* 63, 1-10
+  (2016). doi:10.1016/j.molcel.2016.06.012. **PROSS**
 - Weinstein JJ, Goldenzweig A, Hoch SY, Fleishman SJ. PROSS 2: a new server for
   the design of stable and highly expressed protein variants. *Bioinformatics*
-  37, 123–125 (2021). doi:10.1093/bioinformatics/btaa1071
+  37, 123-125 (2021). doi:10.1093/bioinformatics/btaa1071
 - Peleg Y, *et al.* Community-wide experimental evaluation of the PROSS
   stability-design method. *J Mol Biol* 433, 166964 (2021).
   doi:10.1016/j.jmb.2021.166964
 - Khersonsky O, *et al.* Automated design of efficient and functionally diverse
-  enzyme repertoires. *Mol Cell* (2018). PMID:30270109 — **FuncLib**, the
+  enzyme repertoires. *Mol Cell* (2018). PMID:30270109. **FuncLib**, the
   closest relative to `make-resfile`
 - Weinstein JY, *et al.* Designed active-site library reveals thousands of
   functional GFP variants. *Nat Commun* 14, 2890 (2023).
-  doi:10.1038/s41467-023-38099-z — **htFuncLib**
+  doi:10.1038/s41467-023-38099-z. **htFuncLib**
 - Goldenzweig A, Fleishman SJ. Principles of protein stability and their
-  application in computational design. *Annu Rev Biochem* 87, 105–129 (2018).
+  application in computational design. *Annu Rev Biochem* 87, 105-129 (2018).
   doi:10.1146/annurev-biochem-062917-012102
 
 ### Entropy-based design
@@ -444,7 +445,7 @@ term buys.
 
 ### Context
 
-- Isakova *et al.* (2026) — Descent from a common ancestor restricts
+- Isakova *et al.* (2026). Descent from a common ancestor restricts
   exploration of protein sequence space
 - Further reading in the project notes on relative-entropy protein design,
   evolution-entropy hybrid residue ranking, local entropy in proteins, and
@@ -456,4 +457,4 @@ volume and pages from the PDFs before reusing these in a manuscript.
 
 ## License
 
-MIT — see `LICENSE`.
+MIT. See `LICENSE`.
